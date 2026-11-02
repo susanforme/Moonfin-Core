@@ -76,7 +76,7 @@ jobs:
               raise SystemExit(0)
           _, source_ref = max(source_branches)
           upstream_commit = git('rev-parse', upstream_ref + '^{commit}')
-          paths = ['lib/l10n/app_zh_Hans.arb',
+          paths = ['lib/l10n/app_zh.arb',
                    '.github/workflows/android-tv-cn.yml',
                    '.github/workflows/sync-upstream-cn.yml']
           overlay = {path: git('show', source_ref + ':' + path) + '\n' for path in paths}
@@ -91,7 +91,7 @@ jobs:
           chinese = json.loads(Path('lib/l10n/app_zh.arb').read_text())
           def parameters(value):
               return set(re.findall(r'\{\s*([A-Za-z_]\w*)\s*[,}]', value))
-          merged = {'@@locale': 'zh_Hans'}
+          merged = {'@@locale': 'zh'}
           fallback = []
           for key, value in english.items():
               if key.startswith('@'):
@@ -111,8 +111,8 @@ jobs:
           for path, content in overlay.items():
               Path(path).parent.mkdir(parents=True, exist_ok=True)
               Path(path).write_text(content)
-          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'config', 'user.name', 'Codex'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'codex@openai.com'], check=True)
           subprocess.run(['git', 'add', '--', *paths], check=True)
           subprocess.run(['git', 'commit', '-m', f'Add CN translations and Android TV workflows to {tag}'], check=True)
           # No force push: a concurrent/manual branch creation must not be overwritten.

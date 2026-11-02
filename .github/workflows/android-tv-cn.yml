@@ -8,7 +8,7 @@ on:
   push:
     branches: ['*-cn']
     paths:
-      - lib/l10n/app_zh_Hans.arb
+      - lib/l10n/app_zh.arb
       - .github/workflows/android-tv-cn.yml
       - .github/workflows/sync-upstream-cn.yml
   workflow_dispatch:
@@ -154,7 +154,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Prepare Simplified Chinese fallback
+      - name: Validate Simplified Chinese resources
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -164,7 +164,9 @@ jobs:
 
           root = Path('lib/l10n')
           english = json.loads((root / 'app_en.arb').read_text())
-          chinese = json.loads((root / 'app_zh_Hans.arb').read_text())
+          chinese = json.loads((root / 'app_zh.arb').read_text())
+          if chinese.get('@@locale') != 'zh':
+              raise SystemExit('Expected the upstream Simplified Chinese locale: zh.')
           keys = {key for key in english if not key.startswith('@')}
           if keys != {key for key in chinese if not key.startswith('@')}:
               raise SystemExit('CN message keys differ from the upstream template; synchronize translations first.')
@@ -172,10 +174,6 @@ jobs:
           for key in keys:
               if not chinese[key] or parameters(chinese[key]) != parameters(english[key]):
                   raise SystemExit('Missing translation or parameter mismatch: ' + key)
-          # Upstream language-only fallback resolves zh-CN devices to zh.
-          # Give those devices the same translations without changing app logic.
-          chinese['@@locale'] = 'zh'
-          (root / 'app_zh.arb').write_text(json.dumps(chinese, ensure_ascii=False, indent=2) + '\n')
           PY
 
       - name: Resolve locked dependencies and generate localizations
@@ -231,7 +229,7 @@ jobs:
             'Moonfin Android TV 简体中文 Fork，使用独立签名。' \
             "版本：$CN_VERSION；versionCode：$CN_BUILD；源码：$commit。" \
             '保留官方播放器及 Emby / Jellyfin 通信逻辑。' \
-            '在 设置 → 常规 → 界面语言 中选择“中文 (简体)”。' \
+            '在 设置 → 常规 → 界面语言 中选择“中文”（简体中文资源）。' \
             '首次安装不能覆盖官方签名版本；之后使用相同个人签名的 CN APK 可覆盖升级。' \
             '未运行仓库测试；电视实机兼容性由使用者验证。' \
             > "$RUNNER_TEMP/cn-release-notes.md"
