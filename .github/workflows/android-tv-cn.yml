@@ -176,11 +176,38 @@ jobs:
                   raise SystemExit('Missing translation or parameter mismatch: ' + key)
           PY
 
+      - name: Keep only Simplified Chinese and English for this build
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('lib/l10n')
+          keep = {'app_en.arb', 'app_zh.arb'}
+          if not all((root / name).is_file() for name in keep):
+              raise SystemExit('English and Simplified Chinese ARB files are required.')
+          # Trim only the disposable CI checkout. All translations remain in Git.
+          for path in root.glob('app_*.arb'):
+              if path.name not in keep:
+                  path.unlink()
+          # Remove tracked output from previous all-language generation, then
+          # regenerate the delegate and language classes from the two ARB files.
+          for path in root.glob('app_localizations*.dart'):
+              path.unlink()
+          PY
+
       - name: Resolve locked dependencies and generate localizations
         run: |
           set -euo pipefail
           flutter pub get --enforce-lockfile
           flutter gen-l10n
+          python3 - <<'PY'
+          from pathlib import Path
+
+          generated = {path.name for path in Path('lib/l10n').glob('app_localizations_*.dart')}
+          if generated != {'app_localizations_en.dart', 'app_localizations_zh.dart'}:
+              raise SystemExit(f'Unexpected generated language files: {sorted(generated)}')
+          PY
 
       - name: Build Android TV release APK
         run: |
@@ -230,6 +257,7 @@ jobs:
             "版本：$CN_VERSION；versionCode：$CN_BUILD；源码：$commit。" \
             '保留官方播放器及 Emby / Jellyfin 通信逻辑。' \
             '在 设置 → 常规 → 界面语言 中选择“中文”（简体中文资源）。' \
+            '此 APK 的应用界面仅包含简体中文和英文，英文用于语言回退。' \
             '首次安装不能覆盖官方签名版本；之后使用相同个人签名的 CN APK 可覆盖升级。' \
             '未运行仓库测试；电视实机兼容性由使用者验证。' \
             > "$RUNNER_TEMP/cn-release-notes.md"
