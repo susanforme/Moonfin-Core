@@ -212,7 +212,7 @@ jobs:
       - name: Build Android TV release APK
         run: |
           set -euo pipefail
-          flutter build apk --release --no-pub --flavor androidTv \
+          flutter build apk --release --flavor androidTv \
             --dart-define=MOONFIN_FORCE_TV=true \
             --dart-define=DISTRIBUTION_CHANNEL=android_tv_apk
 
