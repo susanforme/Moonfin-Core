@@ -1,0 +1,135 @@
+name: Sync upstream stable tag to CN
+
+# GitHub only runs scheduled workflows from the DEFAULT branch. Make a CN
+# branch the default, or also place these two workflows on your default branch.
+# A manual run works on the CN branch without changing the default branch.
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-cn
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'Moonfin-Client/Moonfin-Core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      ref: ${{ steps.sync.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create the latest stable CN branch
+        id: sync
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          # Keep upstream tags in a private ref namespace, leaving origin's tags untouched.
+          git fetch --no-tags https://github.com/Moonfin-Client/Moonfin-Core.git \
+            '+refs/tags/*:refs/upstream-tags/*'
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          def output(**values):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  for key, value in values.items():
+                      out.write(f'{key}={value}\n')
+
+          refs = git('for-each-ref', '--format=%(refname)', 'refs/upstream-tags/').splitlines()
+          tags = []
+          for ref in refs:
+              tag = ref.removeprefix('refs/upstream-tags/')
+              if re.fullmatch(r'\d+\.\d+\.\d+', tag):
+                  tags.append((tuple(map(int, tag.split('.'))), tag, ref))
+          if not tags:
+              raise SystemExit('No upstream stable semantic-version tags were found.')
+          _, tag, upstream_ref = max(tags)
+          target = tag + '-cn'
+          branches = git('for-each-ref', '--format=%(refname)', 'refs/remotes/origin/').splitlines()
+          source_branches = []
+          for ref in branches:
+              match = re.fullmatch(r'refs/remotes/origin/(\d+\.\d+\.\d+)-cn', ref)
+              if match:
+                  source_branches.append((tuple(map(int, match[1].split('.'))), ref))
+          if not source_branches:
+              raise SystemExit('No versioned *-cn source branch exists; push 3.0.0-cn first.')
+          if 'refs/remotes/origin/' + target in branches:
+              # Never reset or overwrite a branch that may contain newer translations.
+              output(changed='false', ref='')
+              print(target + ' already exists; nothing to synchronize.')
+              raise SystemExit(0)
+          _, source_ref = max(source_branches)
+          upstream_commit = git('rev-parse', upstream_ref + '^{commit}')
+          paths = ['lib/l10n/app_zh_Hans.arb',
+                   '.github/workflows/android-tv-cn.yml',
+                   '.github/workflows/sync-upstream-cn.yml']
+          overlay = {path: git('show', source_ref + ':' + path) + '\n' for path in paths}
+          subprocess.run(['git', 'switch', '--detach', upstream_commit], check=True)
+          subprocess.run(['git', 'switch', '-c', target], check=True)
+
+          # Retain CN translations whose parameters still match. New/changed
+          # messages use the upstream Chinese translation, then English, until
+          # translated. English metadata stays authoritative for ICU parameters.
+          old = json.loads(overlay[paths[0]])
+          english = json.loads(Path('lib/l10n/app_en.arb').read_text())
+          chinese = json.loads(Path('lib/l10n/app_zh.arb').read_text())
+          def parameters(value):
+              return set(re.findall(r'\{\s*([A-Za-z_]\w*)\s*[,}]', value))
+          merged = {'@@locale': 'zh_Hans'}
+          fallback = []
+          for key, value in english.items():
+              if key.startswith('@'):
+                  if not key.startswith('@@'):
+                      merged[key] = value
+                  continue
+              chosen = None
+              for candidate in [old.get(key), chinese.get(key)]:
+                  if candidate and parameters(candidate) == parameters(value):
+                      chosen = candidate
+                      break
+              if chosen is None:
+                  chosen = value
+                  fallback.append(key)
+              merged[key] = chosen
+          overlay[paths[0]] = json.dumps(merged, ensure_ascii=False, indent=2) + '\n'
+          for path, content in overlay.items():
+              Path(path).parent.mkdir(parents=True, exist_ok=True)
+              Path(path).write_text(content)
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          subprocess.run(['git', 'commit', '-m', f'Add CN translations and Android TV workflows to {tag}'], check=True)
+          # No force push: a concurrent/manual branch creation must not be overwritten.
+          subprocess.run(['git', 'push', 'origin', 'HEAD:refs/heads/' + target], check=True)
+          output(changed='true', ref=git('rev-parse', 'HEAD'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Created `{target}` from upstream `{tag}` (`{upstream_commit}`).\n\n')
+              summary.write(f'Preserved CN translations from `{source_ref}`.\n\n')
+              summary.write(f'{len(fallback)} messages fall back to English and need translation.\n')
+              if fallback:
+                  summary.write('\n' + ', '.join(f'`{key}`' for key in fallback) + '\n')
+          PY
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/android-tv-cn.yml
+    with:
+      ref: ${{ needs.sync.outputs.ref }}
+    secrets: inherit

@@ -1,0 +1,240 @@
+name: Android TV CN APK
+
+# Required repository Actions secrets (use the SAME keystore for every update):
+# ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
+# ANDROID_KEY_PASSWORD. ANDROID_KEYSTORE_TYPE is optional (JKS / PKCS12).
+# Run this workflow from a *-cn branch. It never runs the repository test suites.
+on:
+  push:
+    branches: ['*-cn']
+    paths:
+      - lib/l10n/app_zh_Hans.arb
+      - .github/workflows/android-tv-cn.yml
+      - .github/workflows/sync-upstream-cn.yml
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: CN commit to build after upstream synchronization
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-tv-cn-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository != 'Moonfin-Client/Moonfin-Core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve build metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import time
+          from pathlib import Path
+
+          pubspec = Path('pubspec.yaml')
+          text = pubspec.read_text()
+          version = re.search(r'^\s+android_tv_version:\s*[\'"]?([0-9]+\.[0-9]+\.[0-9]+)', text, re.M)
+          sdk = re.search(r'^  FLUTTER_VERSION:\s*[\'"]([^\'"]+)', Path('.github/workflows/build.yml').read_text(), re.M)
+          if not version or not sdk:
+              raise SystemExit('Cannot resolve upstream Android TV / Flutter version; update the CN workflow.')
+          # Seconds since 2020 avoid independent workflow run counters colliding.
+          # Reruns receive a newer versionCode. Builds are serialized above.
+          number = int(time.time()) - 1577836800
+          if not 1 <= number <= 2100000000:
+              raise SystemExit('Android versionCode is outside its supported range.')
+          name = version[1] + '-cn'
+          text, count = re.subn(r'^(\s+android_tv_build_number:)\s*\d+\s*$', rf'\g<1> {number}', text, flags=re.M)
+          if count != 1:
+              raise SystemExit('Expected one android_tv_build_number in pubspec.yaml.')
+          text, count = re.subn(r'^(\s+android_tv_version:)\s*\S+\s*$', rf'\g<1> {name}', text, flags=re.M)
+          if count != 1:
+              raise SystemExit('Expected one android_tv_version in pubspec.yaml.')
+          # Build metadata changes exist only on the disposable CI runner.
+          pubspec.write_text(text)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'flutter={sdk[1]}\nversion={name}\nnumber={number}\n')
+              out.write(f'tag=cn-{version[1]}-b{number}\n')
+              out.write(f'apk=Moonfin_AndroidTV_{name}_{number}.apk\n')
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare personal release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_TYPE: ${{ secrets.ANDROID_KEYSTORE_TYPE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          required = ['ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD',
+                      'ANDROID_KEY_ALIAS', 'ANDROID_KEY_PASSWORD']
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit('Missing repository Actions secrets: ' + ', '.join(missing))
+          encoded = ''.join(os.environ['ANDROID_KEYSTORE_BASE64'].split())
+          Path('android/app/release.keystore').write_bytes(base64.b64decode(encoded, validate=True))
+
+          def escape(value):
+              # java.util.Properties reads ISO-8859-1 and backslash escapes.
+              result = []
+              for char in value:
+                  if char in '\\ :=#!':
+                      result.append('\\' + char)
+                  elif char in '\n\r\t':
+                      result.append({'\n': '\\n', '\r': '\\r', '\t': '\\t'}[char])
+                  elif ord(char) > 126 or ord(char) < 32:
+                      units = char.encode('utf-16-be')
+                      result.extend('\\u' + units[i:i+2].hex() for i in range(0, len(units), 2))
+                  else:
+                      result.append(char)
+              return ''.join(result)
+
+          properties = {'storePassword': os.environ['ANDROID_KEYSTORE_PASSWORD'],
+                        'keyAlias': os.environ['ANDROID_KEY_ALIAS'],
+                        'keyPassword': os.environ['ANDROID_KEY_PASSWORD']}
+          if os.environ.get('ANDROID_KEYSTORE_TYPE'):
+              properties['storeType'] = os.environ['ANDROID_KEYSTORE_TYPE']
+          Path('android/keystore.properties').write_text(
+              ''.join(f'{key}={escape(value)}\n' for key, value in properties.items()), encoding='ascii')
+          PY
+          keytool_args=()
+          if [[ -n "${ANDROID_KEYSTORE_TYPE}" ]]; then
+            keytool_args=(-storetype "$ANDROID_KEYSTORE_TYPE")
+          fi
+          keytool -list -keystore android/app/release.keystore \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" \
+            "${keytool_args[@]}" > /dev/null
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install upstream native build tools
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' \
+            'ndk;28.2.13676358' 'cmake;3.22.1'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.metadata.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Prepare Simplified Chinese fallback
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('lib/l10n')
+          english = json.loads((root / 'app_en.arb').read_text())
+          chinese = json.loads((root / 'app_zh_Hans.arb').read_text())
+          keys = {key for key in english if not key.startswith('@')}
+          if keys != {key for key in chinese if not key.startswith('@')}:
+              raise SystemExit('CN message keys differ from the upstream template; synchronize translations first.')
+          parameters = lambda value: set(re.findall(r'\{\s*([A-Za-z_]\w*)\s*[,}]', value))
+          for key in keys:
+              if not chinese[key] or parameters(chinese[key]) != parameters(english[key]):
+                  raise SystemExit('Missing translation or parameter mismatch: ' + key)
+          # Upstream language-only fallback resolves zh-CN devices to zh.
+          # Give those devices the same translations without changing app logic.
+          chinese['@@locale'] = 'zh'
+          (root / 'app_zh.arb').write_text(json.dumps(chinese, ensure_ascii=False, indent=2) + '\n')
+          PY
+
+      - name: Resolve locked dependencies and generate localizations
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          flutter gen-l10n
+
+      - name: Build Android TV release APK
+        run: |
+          set -euo pipefail
+          flutter build apk --release --no-pub --flavor androidTv \
+            --dart-define=MOONFIN_FORCE_TV=true \
+            --dart-define=DISTRIBUTION_CHANNEL=android_tv_apk
+
+      - name: Verify signature and prepare APK
+        env:
+          APK_NAME: ${{ steps.metadata.outputs.apk }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          apk=build/app/outputs/flutter-apk/app-androidtv-release.apk
+          apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/cn-apk-signature.txt"
+          keytool -exportcert -keystore android/app/release.keystore \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" \
+            -file "$RUNNER_TEMP/cn-signing-cert.der" > /dev/null
+          expected=$(sha256sum "$RUNNER_TEMP/cn-signing-cert.der" | cut -d' ' -f1)
+          grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/cn-apk-signature.txt"
+          mkdir -p dist
+          cp "$apk" "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonfin-android-tv-cn-${{ steps.metadata.outputs.number }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish CN release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          CN_VERSION: ${{ steps.metadata.outputs.version }}
+          CN_BUILD: ${{ steps.metadata.outputs.number }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          printf '%s\n' \
+            'Moonfin Android TV 简体中文 Fork，使用独立签名。' \
+            "版本：$CN_VERSION；versionCode：$CN_BUILD；源码：$commit。" \
+            '保留官方播放器及 Emby / Jellyfin 通信逻辑。' \
+            '在 设置 → 常规 → 界面语言 中选择“中文 (简体)”。' \
+            '首次安装不能覆盖官方签名版本；之后使用相同个人签名的 CN APK 可覆盖升级。' \
+            '未运行仓库测试；电视实机兼容性由使用者验证。' \
+            > "$RUNNER_TEMP/cn-release-notes.md"
+          gh release create "$RELEASE_TAG" dist/* --target "$commit" \
+            --title "Moonfin Android TV $CN_VERSION ($CN_BUILD)" \
+            --notes-file "$RUNNER_TEMP/cn-release-notes.md"
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f android/app/release.keystore android/keystore.properties
