@@ -80,7 +80,7 @@ jobs:
           pubspec.write_text(text)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'flutter={sdk[1]}\nnumber={number}\n')
-              out.write(f'apk=Moonfin_AndroidTV_{name}_{number}.apk\n')
+              out.write(f'apk_prefix=Moonfin_AndroidTV_{name}_{number}\n')
           PY
 
       - uses: actions/setup-java@v4
@@ -248,36 +248,86 @@ jobs:
               raise SystemExit(f'Unexpected generated language files: {sorted(generated)}')
           PY
 
-      - name: Build Android TV release APK
+      - name: Configure ABI splits without changing upstream Gradle files
+        run: |
+          set -euo pipefail
+          init_dir="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
+          mkdir -p "$init_dir"
+          cat > "$init_dir/moonfin-cn-abi-splits.gradle" <<'GRADLE'
+          allprojects { targetProject ->
+              targetProject.pluginManager.withPlugin('com.android.application') {
+                  targetProject.extensions.getByName('androidComponents').finalizeDsl { android ->
+                      if (targetProject.findProperty('split-per-abi')?.toString()?.toBoolean()) {
+                          // Upstream flavor ABI filters conflict with Flutter's APK splits.
+                          android.defaultConfig.ndk.abiFilters.clear()
+                          android.productFlavors.each { flavor ->
+                              flavor.ndk.abiFilters.clear()
+                          }
+                      }
+                  }
+              }
+          }
+          GRADLE
+
+      - name: Build Android TV release APKs per architecture
         run: |
           set -euo pipefail
           flutter build apk --release --flavor androidTv \
+            --split-per-abi \
+            --target-platform=android-arm,android-arm64,android-x64 \
+            --android-project-arg=force-version-code-ignoring-abi=true \
             --dart-define=MOONFIN_FORCE_TV=true \
             --dart-define=DISTRIBUTION_CHANNEL=android_tv_apk
 
-      - name: Verify signature and prepare APK
+      - name: Verify and prepare architecture APKs
         env:
-          APK_NAME: ${{ steps.metadata.outputs.apk }}
+          APK_PREFIX: ${{ steps.metadata.outputs.apk_prefix }}
+          CN_BUILD: ${{ steps.metadata.outputs.number }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          apk=build/app/outputs/flutter-apk/app-androidtv-release.apk
           apksigner="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
-          "$apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/cn-apk-signature.txt"
+          aapt="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
           keytool -exportcert -keystore android/app/release.keystore \
             -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" \
             -file "$RUNNER_TEMP/cn-signing-cert.der" > /dev/null
           expected=$(sha256sum "$RUNNER_TEMP/cn-signing-cert.der" | cut -d' ' -f1)
-          grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/cn-apk-signature.txt"
-          mkdir -p dist
-          cp "$apk" "dist/$APK_NAME"
-          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            apk="build/app/outputs/flutter-apk/app-androidtv-$abi-release.apk"
+            [[ -f "$apk" ]] || { echo "Missing release APK for $abi"; exit 1; }
+            "$apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/cn-signature-$abi.txt"
+            grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/cn-signature-$abi.txt"
+            "$aapt" dump badging "$apk" > "$RUNNER_TEMP/cn-badging-$abi.txt"
+            grep -Fx "native-code: '$abi'" "$RUNNER_TEMP/cn-badging-$abi.txt"
+            grep -F "versionCode='$CN_BUILD'" "$RUNNER_TEMP/cn-badging-$abi.txt"
+            name="${APK_PREFIX}_$abi.apk"
+            mkdir -p "dist/$abi"
+            cp "$apk" "dist/$abi/$name"
+            (cd "dist/$abi" && sha256sum "$name" > "$name.sha256")
+          done
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload ARM 32-bit APK
+        uses: actions/upload-artifact@v4
         with:
-          name: moonfin-android-tv-cn-${{ steps.metadata.outputs.number }}
-          path: dist/*
+          name: moonfin-android-tv-cn-armeabi-v7a-${{ steps.metadata.outputs.number }}
+          path: dist/armeabi-v7a/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonfin-android-tv-cn-arm64-v8a-${{ steps.metadata.outputs.number }}
+          path: dist/arm64-v8a/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload x86_64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonfin-android-tv-cn-x86_64-${{ steps.metadata.outputs.number }}
+          path: dist/x86_64/*
           if-no-files-found: error
           retention-days: 30
 
