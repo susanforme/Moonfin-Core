@@ -293,9 +293,42 @@ jobs:
             -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" \
             -file "$RUNNER_TEMP/cn-signing-cert.der" > /dev/null
           expected=$(sha256sum "$RUNNER_TEMP/cn-signing-cert.der" | cut -d' ' -f1)
-          for abi in armeabi-v7a arm64-v8a x86_64; do
-            apk="build/app/outputs/flutter-apk/app-androidtv-$abi-release.apk"
-            [[ -f "$apk" ]] || { echo "Missing release APK for $abi"; exit 1; }
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          candidates = []
+          for path in Path('build/app/outputs').rglob('output-metadata.json'):
+              data = json.loads(path.read_text())
+              if (data.get('variantName', '').lower() == 'androidtvrelease'
+                      and data.get('artifactType', {}).get('type') == 'APK'):
+                  candidates.append((path, data))
+          if len(candidates) != 1:
+              raise SystemExit(f'Expected one androidTvRelease APK metadata file; found {[str(p) for p, _ in candidates]}')
+          metadata, data = candidates[0]
+          print(f'Using Gradle APK metadata: {metadata}')
+          required = ('armeabi-v7a', 'arm64-v8a', 'x86_64')
+          outputs = {}
+          for element in data['elements']:
+              filters = {item['filterType']: item['value'] for item in element['filters']}
+              abi = filters.get('ABI')
+              if abi not in required or abi in outputs:
+                  raise SystemExit(f'Unexpected or duplicate APK ABI in Gradle metadata: {abi}')
+              if str(element.get('versionCode')) != os.environ['CN_BUILD']:
+                  raise SystemExit(f'Unexpected APK versionCode for {abi}: {element.get("versionCode")}')
+              apk = (metadata.parent / element['outputFile']).resolve()
+              if not apk.is_relative_to(metadata.parent.resolve()) or not apk.is_file():
+                  raise SystemExit(f'Gradle APK output is missing or invalid: {apk}')
+              outputs[abi] = apk
+          if set(outputs) != set(required):
+              raise SystemExit(f'Missing APK architectures in Gradle metadata: {set(required) - set(outputs)}')
+          manifest = Path(os.environ['RUNNER_TEMP']) / 'cn-apk-outputs.tsv'
+          manifest.write_text(''.join(f'{abi}\t{outputs[abi]}\n' for abi in required))
+          for abi in required:
+              print(f'{abi}: {outputs[abi]}')
+          PY
+          while IFS=$'\t' read -r abi apk; do
             "$apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/cn-signature-$abi.txt"
             grep -F "Signer #1 certificate SHA-256 digest: $expected" "$RUNNER_TEMP/cn-signature-$abi.txt"
             "$aapt" dump badging "$apk" > "$RUNNER_TEMP/cn-badging-$abi.txt"
@@ -305,7 +338,7 @@ jobs:
             mkdir -p "dist/$abi"
             cp "$apk" "dist/$abi/$name"
             (cd "dist/$abi" && sha256sum "$name" > "$name.sha256")
-          done
+          done < "$RUNNER_TEMP/cn-apk-outputs.tsv"
 
       - name: Upload ARM 32-bit APK
         uses: actions/upload-artifact@v4
@@ -330,6 +363,15 @@ jobs:
           path: dist/x86_64/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Preserve Gradle APK outputs on build or packaging failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cn-unpackaged-apk-outputs-${{ steps.metadata.outputs.number }}
+          path: build/app/outputs/apk/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Remove signing material
         if: always()
