@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: sync-upstream-cn
@@ -78,7 +79,8 @@ jobs:
           upstream_commit = git('rev-parse', upstream_ref + '^{commit}')
           paths = ['lib/l10n/app_zh.arb',
                    '.github/workflows/android-tv-cn.yml',
-                   '.github/workflows/sync-upstream-cn.yml']
+                   '.github/workflows/sync-upstream-cn.yml',
+                   '.github/workflows/publish-cn-artifact.yml']
           overlay = {path: git('show', source_ref + ':' + path) + '\n' for path in paths}
           subprocess.run(['git', 'switch', '--detach', upstream_commit], check=True)
           subprocess.run(['git', 'switch', '-c', target], check=True)

@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: android-tv-cn-apk
@@ -78,8 +79,7 @@ jobs:
           # Build metadata changes exist only on the disposable CI runner.
           pubspec.write_text(text)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'flutter={sdk[1]}\nversion={name}\nnumber={number}\n')
-              out.write(f'tag=cn-{version[1]}-b{number}\n')
+              out.write(f'flutter={sdk[1]}\nnumber={number}\n')
               out.write(f'apk=Moonfin_AndroidTV_{name}_{number}.apk\n')
           PY
 
@@ -281,29 +281,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish CN release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
-          CN_VERSION: ${{ steps.metadata.outputs.version }}
-          CN_BUILD: ${{ steps.metadata.outputs.number }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          commit=$(git rev-parse HEAD)
-          printf '%s\n' \
-            'Moonfin Android TV 简体中文 Fork，使用独立签名。' \
-            "版本：$CN_VERSION；versionCode：$CN_BUILD；源码：$commit。" \
-            '保留官方播放器及 Emby / Jellyfin 通信逻辑。' \
-            '在 设置 → 常规 → 界面语言 中选择“中文”（简体中文资源）。' \
-            '此 APK 的应用界面仅包含简体中文和英文，英文用于语言回退。' \
-            '首次安装不能覆盖官方签名版本；之后使用相同个人签名的 CN APK 可覆盖升级。' \
-            '未运行仓库测试；电视实机兼容性由使用者验证。' \
-            > "$RUNNER_TEMP/cn-release-notes.md"
-          gh release create "$RELEASE_TAG" dist/* --target "$commit" \
-            --title "Moonfin Android TV $CN_VERSION ($CN_BUILD)" \
-            --notes-file "$RUNNER_TEMP/cn-release-notes.md"
-
       - name: Remove signing material
         if: always()
         run: rm -f android/app/release.keystore android/keystore.properties
+
+  publish:
+    needs: build
+    uses: ./.github/workflows/publish-cn-artifact.yml
+    with:
+      run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit

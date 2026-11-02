@@ -1,0 +1,132 @@
+name: Publish existing CN APK
+
+# Retry release publication without compiling or accessing signing secrets.
+# Optional repository secret CN_RELEASE_TOKEN: a fine-grained token restricted
+# to this repository with Contents: read/write. Downloads use GITHUB_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run ID containing the successfully uploaded Android TV CN APK
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      run_id:
+        type: string
+        required: true
+    secrets:
+      CN_RELEASE_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-cn-artifact-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository != 'Moonfin-Client/Moonfin-Core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Resolve original build commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]] || { echo 'Invalid run ID'; exit 1; }
+          commit=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN" --jq '.head_sha')
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid source commit'; exit 1; }
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Download signed APK from original run
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          pattern: moonfin-android-tv-cn-*
+          merge-multiple: true
+          path: dist
+
+      - name: Validate artifact and recover version
+        id: metadata
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import re
+          from pathlib import Path
+
+          files = list(Path('dist').glob('*.apk'))
+          if len(files) != 1:
+              raise SystemExit('Expected exactly one signed CN APK in the artifact.')
+          apk = files[0]
+          match = re.fullmatch(r'Moonfin_AndroidTV_(\d+\.\d+\.\d+)-cn_(\d+)\.apk', apk.name)
+          if not match:
+              raise SystemExit('Unexpected CN APK filename.')
+          manifest = apk.with_name(apk.name + '.sha256')
+          parts = manifest.read_text().strip().split(maxsplit=1)
+          if len(parts) != 2 or parts[1].lstrip('*') != apk.name:
+              raise SystemExit('Unexpected APK checksum manifest.')
+          with apk.open('rb') as stream:
+              actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+          if actual != parts[0]:
+              raise SystemExit('APK checksum mismatch.')
+          version, number = match.groups()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'version={version}-cn\nnumber={number}\ntag=cn-{version}-b{number}\n')
+          PY
+
+      - name: Create or update CN release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.CN_RELEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          CN_VERSION: ${{ steps.metadata.outputs.version }}
+          CN_BUILD: ${{ steps.metadata.outputs.number }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Moonfin Android TV 简体中文 Fork，使用独立签名。' \
+            "版本：$CN_VERSION；versionCode：$CN_BUILD；源码：$SOURCE_COMMIT。" \
+            '应用界面仅包含简体中文和英文，英文用于语言回退。' \
+            '在 设置 → 常规 → 界面语言 中选择“中文”。' \
+            '首次安装不能覆盖官方签名版本；相同个人签名的 CN APK 可覆盖升级。' \
+            "构建记录：https://github.com/$GH_REPO/actions/runs/$SOURCE_RUN" \
+            > "$RUNNER_TEMP/cn-release-notes.md"
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.apk dist/*.sha256 --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/*.apk dist/*.sha256 \
+              --target "$SOURCE_COMMIT" \
+              --title "Moonfin Android TV $CN_VERSION ($CN_BUILD)" \
+              --notes-file "$RUNNER_TEMP/cn-release-notes.md"
+          fi
+
+      - name: Explain publication failure and retain build link
+        if: failure()
+        env:
+          SOURCE_RUN: ${{ inputs.run_id }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          printf '%s\n' \
+            'Release publication failed. The original signed APK remains in its build artifacts.' \
+            "Original build: https://github.com/$GH_REPO/actions/runs/$SOURCE_RUN" \
+            'For a release API 403, check repository policy and the token Contents write permission.' \
+            'If GITHUB_TOKEN is restricted, add repository Actions secret CN_RELEASE_TOKEN with Contents read/write for this repository.' \
+            'Retry Publish existing CN APK with the same run_id; no rebuild or signing secrets are needed.' \
+            >> "$GITHUB_STEP_SUMMARY"
